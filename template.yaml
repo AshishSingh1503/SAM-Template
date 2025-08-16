@@ -16,6 +16,15 @@ Parameters:
     Default: "*"
     Description: Frontend domain for CORS configuration
 
+  TextractMode:
+    Type: String
+    Default: ANALYSIS
+    AllowedValues: [ANALYSIS, DETECTION]
+    Description: Choose ANALYSIS (forms/tables) or DETECTION (raw text)
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
 Globals:
   Function:
     Timeout: 60
@@ -25,7 +34,7 @@ Globals:
     Environment:
       Variables:
         ENVIRONMENT: !Ref Environment
-        LOG_LEVEL: INFO
+        LOG_LEVEL: !If [IsProd, ERROR, INFO]
 
 Resources:
   # -----------------------------
@@ -112,12 +121,12 @@ Resources:
                 Action:
                   - 's3:GetObject'
                   - 's3:GetObjectVersion'
-                Resource: !Sub "${UploadsBucket}/*"
+                Resource: !Sub "${UploadsBucket.Arn}/*"
               - Effect: Allow
                 Action:
                   - 's3:PutObject'
                   - 's3:PutObjectAcl'
-                Resource: !Sub "${ResultsBucket}/*"
+                Resource: !Sub "${ResultsBucket.Arn}/*"
               - Effect: Allow
                 Action:
                   - 'textract:StartDocumentAnalysis'
@@ -164,7 +173,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "textract-results-${Environment}-${AWS::Region}"
-      VisibilityTimeoutSeconds: 360
+      VisibilityTimeoutSeconds: 600   # 2x Lambda timeout (300s)
       MessageRetentionPeriod: 1209600
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt TextractDLQ.Arn
@@ -218,6 +227,7 @@ Resources:
         Variables:
           SNS_TOPIC_ARN: !Ref TextractCompletionTopic
           IAM_ROLE_ARN: !GetAtt TextractServiceRole.Arn
+          TEXTRACT_MODE: !Ref TextractMode
       Events:
         S3Upload:
           Type: S3
@@ -293,3 +303,7 @@ Outputs:
     Value: !GetAtt ProcessResultsFunction.Arn
     Export:
       Name: !Sub "${AWS::StackName}-ProcessResultsFunction"
+
+  UploadApiUrl:
+    Description: Example presigned URL format for uploads
+    Value: !Sub "https://${UploadsBucket}.s3.${AWS::Region}.amazonaws.com/{filename.pdf}"
