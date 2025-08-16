@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless application to extract text and structured data from PDFs using
+  Amazon Textract, then clean and store the results as CSV.
+
+Globals:
+  Function:
+    Timeout: 60
+    Runtime: python3.12
+    Tracing: Active
+    MemorySize: 256
+
+Resources:
+  # -----------------------------
+  # 1. S3 Buckets
+  # -----------------------------
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "pdf-uploads-${AWS::AccountId}-${AWS::Region}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: ["PUT", "GET", "HEAD"]
+            AllowedOrigins: ["https://your-frontend-domain.com"]  # tighten CORS
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "pdf-results-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # -----------------------------
+  # 2. IAM Roles
+  # -----------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaS3TextractPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub "${UploadsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub "${ResultsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - 'textract:StartDocumentAnalysis'
+                  - 'textract:StartDocumentTextDetection'
+                  - 'textract:GetDocumentAnalysis'
+                  - 'textract:GetDocumentTextDetection'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt TextractResultQueue.Arn
+
+  TextractServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [textract.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: TextractSNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref TextractCompletionTopic
+
+  # -----------------------------
+  # 3. SNS & SQS
+  # -----------------------------
+  TextractCompletionTopic:
+    Type: AWS::SNS::Topic
+
+  TextractResultQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      RedrivePolicy:                      # DLQ for resiliency
+        deadLetterTargetArn: !GetAtt TextractDLQ.Arn
+        maxReceiveCount: 5
+
+  TextractDLQ:
+    Type: AWS::SQS::Queue
+
+  SNSToSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref TextractResultQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt TextractResultQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Ref TextractCompletionTopic
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt TextractResultQueue.Arn
+      TopicArn: !Ref TextractCompletionTopic
+
+  # -----------------------------
+  # 4. Lambda Functions
+  # -----------------------------
+  StartTextractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: start_textract_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref TextractCompletionTopic
+          IAM_ROLE_ARN: !GetAtt TextractServiceRole.Arn
+      Events:
+        S3Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadsBucket
+            Events: s3:ObjectCreated:*
+
+  ProcessResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: process_results_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 512
+      Timeout: 300
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          RESULTS_PREFIX: "processed/"
+      Events:
+        SQSMessage:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TextractResultQueue.Arn
+            BatchSize: 1
