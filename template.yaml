@@ -4,12 +4,28 @@ Description: >
   Serverless application to extract text and structured data from PDFs using
   Amazon Textract, then clean and store the results as CSV.
 
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource naming
+  
+  FrontendDomain:
+    Type: String
+    Default: "*"
+    Description: Frontend domain for CORS configuration
+
 Globals:
   Function:
     Timeout: 60
     Runtime: python3.12
     Tracing: Active
     MemorySize: 256
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        LOG_LEVEL: INFO
 
 Resources:
   # -----------------------------
@@ -18,25 +34,58 @@ Resources:
   UploadsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "pdf-uploads-${AWS::AccountId}-${AWS::Region}"
+      BucketName: !Sub "pdf-uploads-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
             AllowedMethods: ["PUT", "GET", "HEAD"]
-            AllowedOrigins: ["https://your-frontend-domain.com"]  # tighten CORS
+            AllowedOrigins: [!Ref FrontendDomain]
+            MaxAge: 3600
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              Days: 30
+              StorageClass: STANDARD_IA
 
   ResultsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "pdf-results-${AWS::AccountId}-${AWS::Region}"
+      BucketName: !Sub "pdf-results-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 90
 
   # -----------------------------
   # 2. IAM Roles
@@ -53,6 +102,7 @@ Resources:
             Action: ['sts:AssumeRole']
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: LambdaS3TextractPolicy
           PolicyDocument:
@@ -61,11 +111,13 @@ Resources:
               - Effect: Allow
                 Action:
                   - 's3:GetObject'
-                Resource: !Sub "${UploadsBucket.Arn}/*"
+                  - 's3:GetObjectVersion'
+                Resource: !Sub "${UploadsBucket}/*"
               - Effect: Allow
                 Action:
                   - 's3:PutObject'
-                Resource: !Sub "${ResultsBucket.Arn}/*"
+                  - 's3:PutObjectAcl'
+                Resource: !Sub "${ResultsBucket}/*"
               - Effect: Allow
                 Action:
                   - 'textract:StartDocumentAnalysis'
@@ -104,16 +156,27 @@ Resources:
   # -----------------------------
   TextractCompletionTopic:
     Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "textract-completion-${Environment}"
+      KmsMasterKeyId: alias/aws/sns
 
   TextractResultQueue:
     Type: AWS::SQS::Queue
     Properties:
-      RedrivePolicy:                      # DLQ for resiliency
+      QueueName: !Sub "textract-results-${Environment}-${AWS::Region}"
+      VisibilityTimeoutSeconds: 360
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
         deadLetterTargetArn: !GetAtt TextractDLQ.Arn
-        maxReceiveCount: 5
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
 
   TextractDLQ:
     Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "textract-dlq-${Environment}-${AWS::Region}"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
 
   SNSToSQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -123,11 +186,12 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal: '*'
+            Principal:
+              Service: sns.amazonaws.com
             Action: 'sqs:SendMessage'
             Resource: !GetAtt TextractResultQueue.Arn
             Condition:
-              ArnLike:
+              ArnEquals:
                 aws:SourceArn: !Ref TextractCompletionTopic
 
   SNSSubscription:
@@ -146,6 +210,10 @@ Resources:
       CodeUri: src/
       Handler: start_textract_function.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
+      ReservedConcurrencyLimit: 10
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt StartTextractDLQ.Arn
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref TextractCompletionTopic
@@ -156,6 +224,11 @@ Resources:
           Properties:
             Bucket: !Ref UploadsBucket
             Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
 
   ProcessResultsFunction:
     Type: AWS::Serverless::Function
@@ -165,6 +238,10 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       MemorySize: 512
       Timeout: 300
+      ReservedConcurrencyLimit: 5
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt ProcessResultsDLQ.Arn
       Environment:
         Variables:
           RESULTS_BUCKET: !Ref ResultsBucket
@@ -175,3 +252,44 @@ Resources:
           Properties:
             Queue: !GetAtt TextractResultQueue.Arn
             BatchSize: 1
+            MaximumBatchingWindowInSeconds: 5
+
+  # Additional DLQs for Lambda functions
+  StartTextractDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "start-textract-dlq-${Environment}-${AWS::Region}"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  ProcessResultsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "process-results-dlq-${Environment}-${AWS::Region}"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+Outputs:
+  UploadsBucketName:
+    Description: Name of the S3 bucket for PDF uploads
+    Value: !Ref UploadsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-UploadsBucket"
+
+  ResultsBucketName:
+    Description: Name of the S3 bucket for processed results
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucket"
+
+  StartTextractFunctionArn:
+    Description: ARN of the Start Textract Lambda function
+    Value: !GetAtt StartTextractFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StartTextractFunction"
+
+  ProcessResultsFunctionArn:
+    Description: ARN of the Process Results Lambda function
+    Value: !GetAtt ProcessResultsFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ProcessResultsFunction"
